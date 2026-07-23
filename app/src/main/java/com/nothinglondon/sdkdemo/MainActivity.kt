@@ -129,6 +129,10 @@ private const val TILT_SCALE = 2.5f
 private const val MAX_BRIGHT = 4095
 
 private enum class GState { READY, PLAYING, GAME_OVER, WIN }
+enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER }
+data class Ball(var x: Float, var y: Float, var vx: Float, var vy: Float)
+data class PowerUpDrop(var x: Float, var y: Float, val type: PowerUpType)
+data class Laser(var x: Int, var y: Int)
 
 @Composable
 fun GlyphPongDashboard() {
@@ -136,10 +140,12 @@ fun GlyphPongDashboard() {
 
     // ── Game state ──
     var state by remember { mutableStateOf(GState.READY) }
-    var ballX by remember { mutableFloatStateOf(W / 2f) }
-    var ballY by remember { mutableFloatStateOf(H - 3f) }
-    var ballVx by remember { mutableFloatStateOf(0.35f) }
-    var ballVy by remember { mutableFloatStateOf(-INITIAL_SPEED) }
+    val balls = remember { mutableListOf<Ball>() }
+    val powerUps = remember { mutableListOf<PowerUpDrop>() }
+    val lasers = remember { mutableListOf<Laser>() }
+    var activePowerUp by remember { mutableStateOf<PowerUpType?>(null) }
+    var powerUpTimer by remember { mutableIntStateOf(0) }
+    var paddleWidth by remember { mutableIntStateOf(PADDLE_WIDTH) }
     var speed by remember { mutableFloatStateOf(INITIAL_SPEED) }
     var paddleX by remember { mutableFloatStateOf((W - PADDLE_WIDTH) / 2f) }
     var bricks by remember { mutableStateOf(Array(BRICK_ROWS) { BooleanArray(W) { true } }) }
@@ -175,11 +181,13 @@ fun GlyphPongDashboard() {
         bricksLeft = BRICK_ROWS * W
         score = 0
         speed = INITIAL_SPEED
-        paddleX = (W - PADDLE_WIDTH) / 2f
-        ballX = W / 2f
-        ballY = H - 3f
-        ballVx = 0.35f
-        ballVy = -INITIAL_SPEED
+        paddleWidth = PADDLE_WIDTH
+        paddleX = (W - paddleWidth) / 2f
+        balls.clear()
+        powerUps.clear()
+        lasers.clear()
+        activePowerUp = null
+        powerUpTimer = 0
         frame = 0
     }
 
@@ -206,76 +214,167 @@ fun GlyphPongDashboard() {
 
             when (state) {
                 GState.READY -> {
-                    paddleX = (paddleX + adjTilt * 0.3f).coerceIn(0f, (W - PADDLE_WIDTH).toFloat())
-                    ballX = paddleX + PADDLE_WIDTH / 2f
-                    ballY = H - 3f
+                    paddleX = (paddleX + adjTilt * 0.3f).coerceIn(0f, (W - paddleWidth).toFloat())
 
                     // Auto-launch after 2 seconds
                     if (frame >= AUTO_LAUNCH_FRAMES && state == GState.READY) {
                         state = GState.PLAYING
-                        val co = (paddleX + PADDLE_WIDTH / 2f) - W / 2f
-                        ballVx = (co / W) * 0.5f + 0.3f
-                        ballVy = -speed
+                        val co = (paddleX + paddleWidth / 2f) - W / 2f
+                        val startVx = (co / W) * 0.5f + 0.3f
+                        balls.add(Ball(paddleX + paddleWidth / 2f, H - 3f, startVx, -speed))
                         vibrateShort()
                     }
                 }
                 GState.PLAYING -> {
-                    paddleX = (paddleX + adjTilt * 0.3f).coerceIn(0f, (W - PADDLE_WIDTH).toFloat())
-                    ballX += ballVx
-                    ballY += ballVy
+                    paddleX = (paddleX + adjTilt * 0.3f).coerceIn(0f, (W - paddleWidth).toFloat())
+                    
+                    // Update Balls
+                    val ballIt = balls.iterator()
+                    while (ballIt.hasNext()) {
+                        val ball = ballIt.next()
+                        ball.x += ball.vx
+                        ball.y += ball.vy
 
-                    // Wall collisions
-                    if (ballX <= 0f) { ballX = 0f; ballVx = abs(ballVx) }
-                    if (ballX >= W - 1f) { ballX = W - 1f; ballVx = -abs(ballVx) }
-                    if (ballY <= 0f) { ballY = 0f; ballVy = abs(ballVy) }
+                        // Wall collisions
+                        if (ball.x <= 0f) { ball.x = 0f; ball.vx = abs(ball.vx) }
+                        if (ball.x >= W - 1f) { ball.x = W - 1f; ball.vx = -abs(ball.vx) }
+                        if (ball.y <= 0f) { ball.y = 0f; ball.vy = abs(ball.vy) }
 
-                    // Paddle collision
-                    val py = H - 2
-                    if (ballVy > 0 && ballY >= py - 0.5f && ballY <= py + 0.5f) {
-                        val pL = paddleX; val pR = paddleX + PADDLE_WIDTH
-                        if (ballX >= pL - 0.5f && ballX <= pR + 0.5f) {
-                            val hit = (ballX - pL) / PADDLE_WIDTH
-                            ballVx = (hit - 0.5f) * 1.2f
-                            ballVy = -abs(ballVy)
-                            ballY = py - 1f
-                            speed = (speed + SPEED_INC).coerceAtMost(MAX_SPEED)
-                            val r = speed / sqrt(ballVx * ballVx + ballVy * ballVy)
-                            ballVx *= r; ballVy *= r
-                            vibrateShort()
+                        // Paddle collision
+                        val py = H - 2
+                        if (ball.vy > 0 && ball.y >= py - 0.5f && ball.y <= py + 0.5f) {
+                            val pL = paddleX; val pR = paddleX + paddleWidth
+                            if (ball.x >= pL - 0.5f && ball.x <= pR + 0.5f) {
+                                val hit = (ball.x - pL) / paddleWidth
+                                ball.vx = (hit - 0.5f) * 1.2f
+                                ball.vy = -abs(ball.vy)
+                                ball.y = py - 1f
+                                speed = (speed + SPEED_INC).coerceAtMost(MAX_SPEED)
+                                val r = speed / sqrt(ball.vx * ball.vx + ball.vy * ball.vy)
+                                ball.vx *= r; ball.vy *= r
+                                vibrateShort()
+                            }
+                        }
+
+                        // Bottom — ball lost
+                        if (ball.y >= H) {
+                            ballIt.remove()
+                            continue
+                        }
+
+                        // Brick collisions
+                        val bx = ball.x.roundToInt().coerceIn(0, W - 1)
+                        val by = ball.y.roundToInt()
+                        for (row in 0 until BRICK_ROWS) {
+                            val brickY = 1 + row
+                            if (by == brickY && bx in 0 until W && bricks[row][bx]) {
+                                // Create new copy so Compose recomposes
+                                val newBricks = Array(BRICK_ROWS) { r -> bricks[r].copyOf() }
+                                newBricks[row][bx] = false
+                                bricks = newBricks
+                                bricksLeft--
+                                score += (BRICK_ROWS - row) * 10
+
+                                val prevBy = (ball.y - ball.vy).roundToInt()
+                                if (prevBy != brickY) ball.vy = -ball.vy else ball.vx = -ball.vx
+                                vibrateShort()
+
+                                // Spawn Power-Up (15% chance)
+                                if (Math.random() < 0.15) {
+                                    val types = PowerUpType.entries.toTypedArray()
+                                    val type = types[(Math.random() * types.size).toInt()]
+                                    powerUps.add(PowerUpDrop(bx.toFloat(), by.toFloat(), type))
+                                }
+
+                                if (bricksLeft <= 0) {
+                                    state = GState.WIN
+                                    if (score > highScore) highScore = score
+                                    vibrateLong()
+                                }
+                                break
+                            }
                         }
                     }
 
-                    // Bottom — ball lost
-                    if (ballY >= H) {
+                    if (balls.isEmpty() && state == GState.PLAYING) {
                         state = GState.GAME_OVER
                         if (score > highScore) highScore = score
                         vibrateLong()
                     }
-
-                    // Brick collisions
-                    val bx = ballX.roundToInt().coerceIn(0, W - 1)
-                    val by = ballY.roundToInt()
-                    for (row in 0 until BRICK_ROWS) {
-                        val brickY = 1 + row
-                        if (by == brickY && bx in 0 until W && bricks[row][bx]) {
-                            // Create new copy so Compose recomposes
-                            val newBricks = Array(BRICK_ROWS) { r -> bricks[r].copyOf() }
-                            newBricks[row][bx] = false
-                            bricks = newBricks
-                            bricksLeft--
-                            score += (BRICK_ROWS - row) * 10
-
-                            val prevBy = (ballY - ballVy).roundToInt()
-                            if (prevBy != brickY) ballVy = -ballVy else ballVx = -ballVx
-                            vibrateShort()
-
-                            if (bricksLeft <= 0) {
-                                state = GState.WIN
-                                if (score > highScore) highScore = score
-                                vibrateLong()
-                            }
-                            break
+                    
+                    // Update Power-Ups
+                    if (powerUpTimer > 0) {
+                        powerUpTimer--
+                        if (powerUpTimer <= 0) {
+                            activePowerUp = null
+                            paddleWidth = PADDLE_WIDTH
                         }
+                    }
+                    
+                    val py = H - 2
+                    val puIt = powerUps.iterator()
+                    while (puIt.hasNext()) {
+                        val p = puIt.next()
+                        p.y += 0.2f
+                        if (p.y >= py && p.y <= py + 1f) {
+                            if (p.x >= paddleX - 0.5f && p.x <= paddleX + paddleWidth + 0.5f) {
+                                when (p.type) {
+                                    PowerUpType.EXPAND -> { paddleWidth = 7; activePowerUp = p.type; powerUpTimer = 150 }
+                                    PowerUpType.SHRINK -> { paddleWidth = 3; activePowerUp = p.type; powerUpTimer = 150 }
+                                    PowerUpType.MULTI_BALL -> {
+                                        if (balls.isNotEmpty()) {
+                                            val b = balls[0]
+                                            balls.add(Ball(b.x, b.y, -b.vx, b.vy))
+                                        } else {
+                                            balls.add(Ball(paddleX + paddleWidth / 2f, H - 3f, 0.35f, -speed))
+                                        }
+                                        activePowerUp = p.type; powerUpTimer = 30
+                                    }
+                                    PowerUpType.LASER -> { paddleWidth = PADDLE_WIDTH; activePowerUp = p.type; powerUpTimer = 150 }
+                                }
+                                vibrateShort()
+                                puIt.remove()
+                                continue
+                            }
+                        }
+                        if (p.y >= H) puIt.remove()
+                    }
+                    
+                    // Update Lasers
+                    if (activePowerUp == PowerUpType.LASER && frame % 15 == 0) {
+                        val left = paddleX.roundToInt()
+                        val leftLaserX = left + 1
+                        val rightLaserX = left + paddleWidth - 2
+                        lasers.add(Laser(leftLaserX, H - 3))
+                        if (leftLaserX != rightLaserX) {
+                            lasers.add(Laser(rightLaserX, H - 3))
+                        }
+                    }
+                    val laserIt = lasers.iterator()
+                    while (laserIt.hasNext()) {
+                        val l = laserIt.next()
+                        l.y -= 1
+                        if (l.y < 0) { laserIt.remove(); continue }
+                        var hit = false
+                        for (row in 0 until BRICK_ROWS) {
+                            val brickY = 1 + row
+                            if (l.y == brickY && l.x in 0 until W && bricks[row][l.x]) {
+                                val newBricks = Array(BRICK_ROWS) { r -> bricks[r].copyOf() }
+                                newBricks[row][l.x] = false
+                                bricks = newBricks
+                                bricksLeft--
+                                score += (BRICK_ROWS - row) * 10
+                                hit = true
+                                vibrateShort()
+                                if (bricksLeft <= 0) {
+                                    state = GState.WIN
+                                    if (score > highScore) highScore = score
+                                    vibrateLong()
+                                }
+                                break
+                            }
+                        }
+                        if (hit) laserIt.remove()
                     }
                 }
                 GState.GAME_OVER, GState.WIN -> { /* flashCounter handled via frame */ }
@@ -286,14 +385,25 @@ fun GlyphPongDashboard() {
             when (state) {
                 GState.READY -> {
                     renderBricksTo(g, bricks)
-                    renderPaddleTo(g, paddleX)
+                    renderPaddleTo(g, paddleX, paddleWidth)
                     val pulse = (MAX_BRIGHT * (0.5f + 0.5f * sin(frame * 0.15f))).toInt().coerceIn(0, MAX_BRIGHT)
-                    setPixelSafe(g, ballX.roundToInt(), ballY.roundToInt(), pulse)
+                    setPixelSafe(g, (paddleX + paddleWidth / 2f).roundToInt(), H - 3, pulse)
                 }
                 GState.PLAYING -> {
                     renderBricksTo(g, bricks)
-                    renderPaddleTo(g, paddleX)
-                    setPixelSafe(g, ballX.roundToInt(), ballY.roundToInt(), MAX_BRIGHT)
+                    renderPaddleTo(g, paddleX, paddleWidth)
+                    
+                    for (ball in balls) {
+                        setPixelSafe(g, ball.x.roundToInt(), ball.y.roundToInt(), MAX_BRIGHT)
+                    }
+                    if (frame % 4 < 2) {
+                        for (p in powerUps) {
+                            setPixelSafe(g, p.x.roundToInt(), p.y.roundToInt(), 2000)
+                        }
+                    }
+                    for (l in lasers) {
+                        setPixelSafe(g, l.x, l.y, MAX_BRIGHT)
+                    }
                 }
                 GState.GAME_OVER -> {
                     if (frame % 10 < 5) {
@@ -354,9 +464,9 @@ fun GlyphPongDashboard() {
                 when (state) {
                     GState.READY -> {
                         state = GState.PLAYING
-                        val co = (paddleX + PADDLE_WIDTH / 2f) - W / 2f
-                        ballVx = (co / W) * 0.5f + 0.3f
-                        ballVy = -speed
+                        val co = (paddleX + paddleWidth / 2f) - W / 2f
+                        val startVx = (co / W) * 0.5f + 0.3f
+                        balls.add(Ball(paddleX + paddleWidth / 2f, H - 3f, startVx, -speed))
                         vibrateShort()
                     }
                     GState.GAME_OVER, GState.WIN -> {
@@ -417,6 +527,19 @@ fun GlyphPongDashboard() {
         }
 
         Spacer(Modifier.height(20.dp))
+
+        // Active PowerUp Indicator
+        if (activePowerUp != null) {
+            Text(
+                "POWER-UP: ${activePowerUp?.name}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                color = NothingAmber,
+                letterSpacing = 2.sp,
+                modifier = Modifier.padding(bottom = 12.dp)
+            )
+        }
 
         // Stats cards
         Row(
@@ -667,10 +790,10 @@ private fun renderBricksTo(g: IntArray, bricks: Array<BooleanArray>) {
     }
 }
 
-private fun renderPaddleTo(g: IntArray, paddleX: Float) {
+private fun renderPaddleTo(g: IntArray, paddleX: Float, paddleWidth: Int) {
     val y = H - 2
-    val left = paddleX.roundToInt().coerceIn(0, W - PADDLE_WIDTH)
-    for (x in left until (left + PADDLE_WIDTH).coerceAtMost(W)) {
+    val left = paddleX.roundToInt().coerceIn(0, W - paddleWidth)
+    for (x in left until (left + paddleWidth).coerceAtMost(W)) {
         setPixelSafe(g, x, y, 3200)
     }
 }

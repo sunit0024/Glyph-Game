@@ -70,18 +70,26 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
     // ─── Game State ──────────────────────────────────────────────────────
     enum class State { READY, PLAYING, GAME_OVER, WIN }
+    enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER }
+
+    data class Ball(var x: Float, var y: Float, var vx: Float, var vy: Float)
+    data class PowerUpDrop(var x: Float, var y: Float, val type: PowerUpType)
+    data class Laser(var x: Int, var y: Int)
 
     private var state = State.READY
 
-    // Ball — floating-point for smooth sub-pixel movement
-    private var ballX = W / 2f
-    private var ballY = H - 3f
-    private var ballVx = 0.35f
-    private var ballVy = -INITIAL_BALL_SPEED
+    // Balls and Power-ups
+    private var balls = mutableListOf<Ball>()
+    private var powerUpDrops = mutableListOf<PowerUpDrop>()
+    private var lasers = mutableListOf<Laser>()
     private var currentSpeed = INITIAL_BALL_SPEED
 
+    private var activePowerUp: PowerUpType? = null
+    private var powerUpTimer = 0
+
     // Paddle
-    private var paddleX = (W - PADDLE_WIDTH) / 2f // left edge of paddle
+    private var paddleWidth = PADDLE_WIDTH
+    private var paddleX = (W - paddleWidth) / 2f // left edge of paddle
     private var tiltValue = 0f // raw accelerometer x-axis
 
     // Bricks: true = alive
@@ -194,9 +202,9 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
     private fun launchBall() {
         state = State.PLAYING
-        val centerOffset = (paddleX + PADDLE_WIDTH / 2f) - W / 2f
-        ballVx = (centerOffset / W) * 0.5f + 0.3f
-        ballVy = -currentSpeed
+        val centerOffset = (paddleX + paddleWidth / 2f) - W / 2f
+        val startVx = (centerOffset / W) * 0.5f + 0.3f
+        balls.add(Ball(paddleX + paddleWidth / 2f, H - 3f, startVx, -currentSpeed))
         vibrateShort()
     }
 
@@ -208,11 +216,13 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
         bricksRemaining = BRICK_ROWS * W
         score = 0
         currentSpeed = INITIAL_BALL_SPEED
-        paddleX = (W - PADDLE_WIDTH) / 2f
-        ballX = W / 2f
-        ballY = H - 3f
-        ballVx = 0.35f
-        ballVy = -currentSpeed
+        paddleWidth = PADDLE_WIDTH
+        paddleX = (W - paddleWidth) / 2f
+        balls.clear()
+        powerUpDrops.clear()
+        lasers.clear()
+        activePowerUp = null
+        powerUpTimer = 0
         frameCount = 0
         flashCounter = 0
         autoLaunchCounter = 0
@@ -223,10 +233,8 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
         when (state) {
             State.READY -> {
-                // Move paddle with tilt, ball sits on paddle
+                // Move paddle with tilt
                 updatePaddle()
-                ballX = paddleX + PADDLE_WIDTH / 2f
-                ballY = H - 3f
 
                 // Auto-launch countdown
                 autoLaunchCounter++
@@ -237,7 +245,9 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
             State.PLAYING -> {
                 updatePaddle()
-                updateBall()
+                updateBalls()
+                updatePowerUps()
+                updateLasers()
             }
 
             State.GAME_OVER, State.WIN -> {
@@ -257,88 +267,198 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
         paddleX += adjustedTilt * 0.3f
 
         // Clamp paddle to screen bounds
-        paddleX = paddleX.coerceIn(0f, (W - PADDLE_WIDTH).toFloat())
+        paddleX = paddleX.coerceIn(0f, (W - paddleWidth).toFloat())
     }
 
-    private fun updateBall() {
-        // Move ball
-        ballX += ballVx
-        ballY += ballVy
+    private fun updateBalls() {
+        val iterator = balls.iterator()
+        while (iterator.hasNext()) {
+            val ball = iterator.next()
+            
+            // Move ball
+            ball.x += ball.vx
+            ball.y += ball.vy
 
-        // ── Wall collisions ──
-        // Left wall
-        if (ballX <= 0f) {
-            ballX = 0f
-            ballVx = abs(ballVx)
-        }
-        // Right wall
-        if (ballX >= W - 1f) {
-            ballX = W - 1f
-            ballVx = -abs(ballVx)
-        }
-        // Ceiling
-        if (ballY <= 0f) {
-            ballY = 0f
-            ballVy = abs(ballVy)
-        }
+            // ── Wall collisions ──
+            if (ball.x <= 0f) {
+                ball.x = 0f
+                ball.vx = abs(ball.vx)
+            }
+            if (ball.x >= W - 1f) {
+                ball.x = W - 1f
+                ball.vx = -abs(ball.vx)
+            }
+            if (ball.y <= 0f) {
+                ball.y = 0f
+                ball.vy = abs(ball.vy)
+            }
 
-        // ── Paddle collision ──
-        val paddleY = H - 2 // paddle sits on row H-2
-        if (ballVy > 0 && ballY >= paddleY - 0.5f && ballY <= paddleY + 0.5f) {
-            val paddleLeft = paddleX
-            val paddleRight = paddleX + PADDLE_WIDTH
-            if (ballX >= paddleLeft - 0.5f && ballX <= paddleRight + 0.5f) {
-                // Calculate bounce angle based on where ball hits paddle
-                val hitPos = (ballX - paddleLeft) / PADDLE_WIDTH // 0..1
-                ballVx = (hitPos - 0.5f) * 1.2f // deflect left/right
-                ballVy = -abs(ballVy)
-                ballY = paddleY - 1f
+            // ── Paddle collision ──
+            val paddleY = H - 2
+            if (ball.vy > 0 && ball.y >= paddleY - 0.5f && ball.y <= paddleY + 0.5f) {
+                val paddleLeft = paddleX
+                val paddleRight = paddleX + paddleWidth
+                if (ball.x >= paddleLeft - 0.5f && ball.x <= paddleRight + 0.5f) {
+                    val hitPos = (ball.x - paddleLeft) / paddleWidth
+                    ball.vx = (hitPos - 0.5f) * 1.2f
+                    ball.vy = -abs(ball.vy)
+                    ball.y = paddleY - 1f
 
-                // Slight speed increase
-                currentSpeed = (currentSpeed + SPEED_INCREMENT).coerceAtMost(MAX_BALL_SPEED)
-                val speed = currentSpeed
-                val ratio = speed / kotlin.math.sqrt(ballVx * ballVx + ballVy * ballVy)
-                ballVx *= ratio
-                ballVy *= ratio
+                    currentSpeed = (currentSpeed + SPEED_INCREMENT).coerceAtMost(MAX_BALL_SPEED)
+                    val speed = currentSpeed
+                    val ratio = speed / kotlin.math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy)
+                    ball.vx *= ratio
+                    ball.vy *= ratio
 
-                vibrateShort()
+                    vibrateShort()
+                }
+            }
+
+            // ── Bottom boundary — ball lost ──
+            if (ball.y >= H) {
+                iterator.remove()
+                continue
+            }
+
+            // ── Brick collisions ──
+            val bx = ball.x.roundToInt().coerceIn(0, W - 1)
+            val by = ball.y.roundToInt()
+            var hitBrick = false
+
+            for (row in 0 until BRICK_ROWS) {
+                val brickY = BRICK_TOP_OFFSET + row * BRICK_HEIGHT
+                if (by == brickY && bx in 0 until W && bricks[row][bx]) {
+                    bricks[row][bx] = false
+                    bricksRemaining--
+                    score += (BRICK_ROWS - row) * 10
+                    hitBrick = true
+
+                    val prevBy = (ball.y - ball.vy).roundToInt()
+                    if (prevBy != brickY) ball.vy = -ball.vy else ball.vx = -ball.vx
+
+                    vibrateShort()
+
+                    // Spawn Power-Up (15% chance)
+                    if (kotlin.random.Random.nextFloat() < 0.15f) {
+                        val types = PowerUpType.entries.toTypedArray()
+                        val type = types[kotlin.random.Random.nextInt(types.size)]
+                        powerUpDrops.add(PowerUpDrop(bx.toFloat(), by.toFloat(), type))
+                    }
+
+                    if (bricksRemaining <= 0) {
+                        state = State.WIN
+                        vibrateLong()
+                    }
+                    break
+                }
             }
         }
 
-        // ── Bottom boundary — ball lost ──
-        if (ballY >= H) {
+        if (balls.isEmpty() && state == State.PLAYING) {
             state = State.GAME_OVER
             vibrateLong()
-            return
+        }
+    }
+
+    private fun updatePowerUps() {
+        if (powerUpTimer > 0) {
+            powerUpTimer--
+            if (powerUpTimer <= 0) {
+                activePowerUp = null
+                paddleWidth = PADDLE_WIDTH
+            }
         }
 
-        // ── Brick collisions ──
-        val bx = ballX.roundToInt().coerceIn(0, W - 1)
-        val by = ballY.roundToInt()
+        val paddleY = H - 2
+        val iterator = powerUpDrops.iterator()
+        while (iterator.hasNext()) {
+            val p = iterator.next()
+            p.y += 0.2f // falling speed
 
-        for (row in 0 until BRICK_ROWS) {
-            val brickY = BRICK_TOP_OFFSET + row * BRICK_HEIGHT
-            if (by == brickY && bx in 0 until W && bricks[row][bx]) {
-                bricks[row][bx] = false
-                bricksRemaining--
-                score += (BRICK_ROWS - row) * 10 // top rows worth more
+            if (p.y >= paddleY && p.y <= paddleY + 1f) {
+                if (p.x >= paddleX - 0.5f && p.x <= paddleX + paddleWidth + 0.5f) {
+                    // Caught
+                    applyPowerUp(p.type)
+                    vibrateShort()
+                    iterator.remove()
+                    continue
+                }
+            }
+            if (p.y >= H) {
+                iterator.remove()
+            }
+        }
+    }
 
-                // Determine collision direction
-                val prevBy = (ballY - ballVy).roundToInt()
-                if (prevBy != brickY) {
-                    ballVy = -ballVy // vertical hit
+    private fun applyPowerUp(type: PowerUpType) {
+        when (type) {
+            PowerUpType.EXPAND -> {
+                paddleWidth = 7
+                activePowerUp = type
+                powerUpTimer = 150 // 5 seconds at 30 FPS
+            }
+            PowerUpType.SHRINK -> {
+                paddleWidth = 3
+                activePowerUp = type
+                powerUpTimer = 150
+            }
+            PowerUpType.MULTI_BALL -> {
+                if (balls.isNotEmpty()) {
+                    val baseBall = balls[0]
+                    balls.add(Ball(baseBall.x, baseBall.y, -baseBall.vx, baseBall.vy))
                 } else {
-                    ballVx = -ballVx // horizontal hit
+                    balls.add(Ball(paddleX + paddleWidth / 2f, H - 3f, 0.35f, -currentSpeed))
                 }
+                activePowerUp = type
+                powerUpTimer = 30 // brief display
+            }
+            PowerUpType.LASER -> {
+                paddleWidth = PADDLE_WIDTH
+                activePowerUp = type
+                powerUpTimer = 150
+            }
+        }
+    }
 
-                vibrateShort()
+    private fun updateLasers() {
+        if (activePowerUp == PowerUpType.LASER && frameCount % 15 == 0) {
+            val left = paddleX.roundToInt()
+            val leftLaserX = left + 1
+            val rightLaserX = left + paddleWidth - 2
+            lasers.add(Laser(leftLaserX, H - 3))
+            if (leftLaserX != rightLaserX) {
+                lasers.add(Laser(rightLaserX, H - 3))
+            }
+        }
 
-                // Check win
-                if (bricksRemaining <= 0) {
-                    state = State.WIN
-                    vibrateLong()
+        val iterator = lasers.iterator()
+        while (iterator.hasNext()) {
+            val laser = iterator.next()
+            laser.y -= 1
+
+            if (laser.y < 0) {
+                iterator.remove()
+                continue
+            }
+
+            var hit = false
+            for (row in 0 until BRICK_ROWS) {
+                val brickY = BRICK_TOP_OFFSET + row * BRICK_HEIGHT
+                if (laser.y == brickY && laser.x in 0 until W && bricks[row][laser.x]) {
+                    bricks[row][laser.x] = false
+                    bricksRemaining--
+                    score += (BRICK_ROWS - row) * 10
+                    hit = true
+                    vibrateShort()
+                    if (bricksRemaining <= 0) {
+                        state = State.WIN
+                        vibrateLong()
+                    }
+                    break
                 }
-                break // only destroy one brick per frame
+            }
+            if (hit) {
+                iterator.remove()
             }
         }
     }
@@ -355,13 +475,29 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                 // Ball pulses on paddle to indicate "ready"
                 val pulse = (BRIGHT_BALL * (0.5f + 0.5f * kotlin.math.sin(frameCount * 0.15))).toInt()
                     .coerceIn(0, BRIGHT_BALL)
-                setPixel(grid, ballX.roundToInt(), ballY.roundToInt(), pulse)
+                setPixel(grid, (paddleX + paddleWidth / 2f).roundToInt(), H - 3, pulse)
             }
 
             State.PLAYING -> {
                 renderBricks(grid)
                 renderPaddle(grid)
-                setPixel(grid, ballX.roundToInt(), ballY.roundToInt(), BRIGHT_BALL)
+                
+                // Render Balls
+                for (ball in balls) {
+                    setPixel(grid, ball.x.roundToInt(), ball.y.roundToInt(), BRIGHT_BALL)
+                }
+                
+                // Render Power-Ups (Blinking)
+                if (frameCount % 4 < 2) {
+                    for (p in powerUpDrops) {
+                        setPixel(grid, p.x.roundToInt(), p.y.roundToInt(), 2000)
+                    }
+                }
+                
+                // Render Lasers
+                for (laser in lasers) {
+                    setPixel(grid, laser.x, laser.y, BRIGHT_BALL)
+                }
             }
 
             State.GAME_OVER -> {
@@ -379,7 +515,6 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                         setPixel(grid, W - 1 - i, i, BRIGHT_BALL)
                     }
                 }
-                // else: all off (flash)
             }
 
             State.WIN -> {
@@ -423,8 +558,8 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
     private fun renderPaddle(grid: IntArray) {
         val y = H - 2
-        val left = paddleX.roundToInt().coerceIn(0, W - PADDLE_WIDTH)
-        for (x in left until (left + PADDLE_WIDTH).coerceAtMost(W)) {
+        val left = paddleX.roundToInt().coerceIn(0, W - paddleWidth)
+        for (x in left until (left + paddleWidth).coerceAtMost(W)) {
             setPixel(grid, x, y, BRIGHT_PADDLE)
         }
     }
