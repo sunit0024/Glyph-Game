@@ -5,9 +5,12 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
+import com.nothinglondon.sdkdemo.R
 import android.os.VibratorManager
 import android.util.Log
 import com.nothing.ketchum.GlyphMatrixManager
@@ -70,7 +73,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
 
     // ─── Game State ──────────────────────────────────────────────────────
     enum class State { READY, PLAYING, GAME_OVER, WIN }
-    enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER }
+    enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER, EXTRA_LIFE }
 
     data class Ball(var x: Float, var y: Float, var vx: Float, var vy: Float)
     data class PowerUpDrop(var x: Float, var y: Float, val type: PowerUpType)
@@ -91,6 +94,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
     private var paddleWidth = PADDLE_WIDTH
     private var paddleX = (W - paddleWidth) / 2f // left edge of paddle
     private var tiltValue = 0f // raw accelerometer x-axis
+    private var lives = 0
 
     // Bricks: true = alive
     private var bricks = Array(BRICK_ROWS) { BooleanArray(W) { true } }
@@ -106,6 +110,14 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
     private lateinit var bgScope: CoroutineScope
     private var sensorManager: SensorManager? = null
     private var vibrator: Vibrator? = null
+    
+    // SoundPool
+    private var soundPool: SoundPool? = null
+    private var soundBounce = 0
+    private var soundPowerup = 0
+    private var soundLaser = 0
+    private var soundHit = 0
+    private var soundGameover = 0
 
     private val sensorListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent?) {
@@ -147,6 +159,25 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
             getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
+        // Set up SoundPool
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+            
+        soundPool = SoundPool.Builder()
+            .setMaxStreams(10)
+            .setAudioAttributes(audioAttributes)
+            .build()
+            
+        soundPool?.let {
+            soundBounce = it.load(context, R.raw.bounce, 1)
+            soundPowerup = it.load(context, R.raw.powerup, 1)
+            soundLaser = it.load(context, R.raw.laser, 1)
+            soundHit = it.load(context, R.raw.hit, 1)
+            soundGameover = it.load(context, R.raw.gameover, 1)
+        }
+
         resetGame()
 
         // Start game loop
@@ -175,7 +206,15 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
     override fun performOnServiceDisconnected(context: Context) {
         Log.d(TAG, "Service disconnected — cleaning up")
         sensorManager?.unregisterListener(sensorListener)
+        soundPool?.release()
+        soundPool = null
         if (::bgScope.isInitialized) bgScope.cancel()
+    }
+
+    private fun playSound(soundId: Int) {
+        if (soundId != 0) {
+            soundPool?.play(soundId, 1f, 1f, 0, 0, 1f)
+        }
     }
 
     // ─── Glyph Touch/Button Events ────────────────────────────────────────
@@ -215,6 +254,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
         bricks = Array(BRICK_ROWS) { BooleanArray(W) { true } }
         bricksRemaining = BRICK_ROWS * W
         score = 0
+        lives = 0
         currentSpeed = INITIAL_BALL_SPEED
         paddleWidth = PADDLE_WIDTH
         paddleX = (W - paddleWidth) / 2f
@@ -310,6 +350,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                     ball.vx *= ratio
                     ball.vy *= ratio
 
+                    playSound(soundBounce)
                     vibrateShort()
                 }
             }
@@ -336,6 +377,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                     val prevBy = (ball.y - ball.vy).roundToInt()
                     if (prevBy != brickY) ball.vy = -ball.vy else ball.vx = -ball.vx
 
+                    playSound(soundHit)
                     vibrateShort()
 
                     // Spawn Power-Up (15% chance)
@@ -355,8 +397,16 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
         }
 
         if (balls.isEmpty() && state == State.PLAYING) {
-            state = State.GAME_OVER
-            vibrateLong()
+            if (lives > 0) {
+                lives--
+                state = State.READY
+                autoLaunchCounter = 0
+                vibrateLong()
+            } else {
+                state = State.GAME_OVER
+                playSound(soundGameover)
+                vibrateLong()
+            }
         }
     }
 
@@ -378,6 +428,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
             if (p.y >= paddleY && p.y <= paddleY + 1f) {
                 if (p.x >= paddleX - 0.5f && p.x <= paddleX + paddleWidth + 0.5f) {
                     // Caught
+                    playSound(soundPowerup)
                     applyPowerUp(p.type)
                     vibrateShort()
                     iterator.remove()
@@ -417,6 +468,11 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                 activePowerUp = type
                 powerUpTimer = 150
             }
+            PowerUpType.EXTRA_LIFE -> {
+                lives++
+                activePowerUp = type
+                powerUpTimer = 30 // brief display
+            }
         }
     }
 
@@ -429,6 +485,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
             if (leftLaserX != rightLaserX) {
                 lasers.add(Laser(rightLaserX, H - 3))
             }
+            playSound(soundLaser)
         }
 
         val iterator = lasers.iterator()
@@ -449,6 +506,7 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                     bricksRemaining--
                     score += (BRICK_ROWS - row) * 10
                     hit = true
+                    playSound(soundHit)
                     vibrateShort()
                     if (bricksRemaining <= 0) {
                         state = State.WIN
@@ -488,9 +546,17 @@ class GlyphPongService : GlyphMatrixService("Glyph-Pong") {
                 }
                 
                 // Render Power-Ups (Blinking)
-                if (frameCount % 4 < 2) {
-                    for (p in powerUpDrops) {
-                        setPixel(grid, p.x.roundToInt(), p.y.roundToInt(), 2000)
+                for (p in powerUpDrops) {
+                    if (p.type == PowerUpType.EXTRA_LIFE) {
+                        // Fast, distinct strobe for Extra Life
+                        if (frameCount % 2 == 0) {
+                            setPixel(grid, p.x.roundToInt(), p.y.roundToInt(), 4000)
+                        }
+                    } else {
+                        // Normal blink for others
+                        if (frameCount % 4 < 2) {
+                            setPixel(grid, p.x.roundToInt(), p.y.roundToInt(), 2000)
+                        }
                     }
                 }
                 

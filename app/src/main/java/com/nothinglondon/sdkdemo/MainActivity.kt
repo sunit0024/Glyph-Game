@@ -5,6 +5,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.os.Bundle
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -129,7 +131,7 @@ private const val TILT_SCALE = 2.5f
 private const val MAX_BRIGHT = 4095
 
 private enum class GState { READY, PLAYING, GAME_OVER, WIN }
-enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER }
+enum class PowerUpType { EXPAND, SHRINK, MULTI_BALL, LASER, EXTRA_LIFE }
 data class Ball(var x: Float, var y: Float, var vx: Float, var vy: Float)
 data class PowerUpDrop(var x: Float, var y: Float, val type: PowerUpType)
 data class Laser(var x: Int, var y: Int)
@@ -148,6 +150,7 @@ fun GlyphPongDashboard() {
     var paddleWidth by remember { mutableIntStateOf(PADDLE_WIDTH) }
     var speed by remember { mutableFloatStateOf(INITIAL_SPEED) }
     var paddleX by remember { mutableFloatStateOf((W - PADDLE_WIDTH) / 2f) }
+    var lives by remember { mutableIntStateOf(0) }
     var bricks by remember { mutableStateOf(Array(BRICK_ROWS) { BooleanArray(W) { true } }) }
     var bricksLeft by remember { mutableIntStateOf(BRICK_ROWS * W) }
     var score by remember { mutableIntStateOf(0) }
@@ -175,11 +178,46 @@ fun GlyphPongDashboard() {
         catch (_: Exception) {}
     }
 
+    // SoundPool
+    val soundPool = remember {
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        SoundPool.Builder()
+            .setMaxStreams(10)
+            .setAudioAttributes(audioAttributes)
+            .build()
+    }
+    
+    val soundIds = remember { mutableMapOf<String, Int>() }
+    
+    LaunchedEffect(Unit) {
+        soundIds["bounce"] = soundPool.load(context, R.raw.bounce, 1)
+        soundIds["powerup"] = soundPool.load(context, R.raw.powerup, 1)
+        soundIds["laser"] = soundPool.load(context, R.raw.laser, 1)
+        soundIds["hit"] = soundPool.load(context, R.raw.hit, 1)
+        soundIds["gameover"] = soundPool.load(context, R.raw.gameover, 1)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            soundPool.release()
+        }
+    }
+    
+    fun playSound(key: String) {
+        soundIds[key]?.let { id ->
+            if (id != 0) soundPool.play(id, 1f, 1f, 0, 0, 1f)
+        }
+    }
+
     fun resetGame() {
         state = GState.READY
         bricks = Array(BRICK_ROWS) { BooleanArray(W) { true } }
         bricksLeft = BRICK_ROWS * W
         score = 0
+        lives = 0
         speed = INITIAL_SPEED
         paddleWidth = PADDLE_WIDTH
         paddleX = (W - paddleWidth) / 2f
@@ -252,6 +290,7 @@ fun GlyphPongDashboard() {
                                 speed = (speed + SPEED_INC).coerceAtMost(MAX_SPEED)
                                 val r = speed / sqrt(ball.vx * ball.vx + ball.vy * ball.vy)
                                 ball.vx *= r; ball.vy *= r
+                                playSound("bounce")
                                 vibrateShort()
                             }
                         }
@@ -277,6 +316,7 @@ fun GlyphPongDashboard() {
 
                                 val prevBy = (ball.y - ball.vy).roundToInt()
                                 if (prevBy != brickY) ball.vy = -ball.vy else ball.vx = -ball.vx
+                                playSound("hit")
                                 vibrateShort()
 
                                 // Spawn Power-Up (15% chance)
@@ -297,9 +337,17 @@ fun GlyphPongDashboard() {
                     }
 
                     if (balls.isEmpty() && state == GState.PLAYING) {
-                        state = GState.GAME_OVER
-                        if (score > highScore) highScore = score
-                        vibrateLong()
+                        if (lives > 0) {
+                            lives--
+                            state = GState.READY
+                            frame = 0 // reset auto-launch timer
+                            vibrateLong()
+                        } else {
+                            state = GState.GAME_OVER
+                            if (score > highScore) highScore = score
+                            playSound("gameover")
+                            vibrateLong()
+                        }
                     }
                     
                     // Update Power-Ups
@@ -331,7 +379,9 @@ fun GlyphPongDashboard() {
                                         activePowerUp = p.type; powerUpTimer = 30
                                     }
                                     PowerUpType.LASER -> { paddleWidth = PADDLE_WIDTH; activePowerUp = p.type; powerUpTimer = 150 }
+                                    PowerUpType.EXTRA_LIFE -> { lives++; activePowerUp = p.type; powerUpTimer = 30 }
                                 }
+                                playSound("powerup")
                                 vibrateShort()
                                 puIt.remove()
                                 continue
@@ -349,6 +399,7 @@ fun GlyphPongDashboard() {
                         if (leftLaserX != rightLaserX) {
                             lasers.add(Laser(rightLaserX, H - 3))
                         }
+                        playSound("laser")
                     }
                     val laserIt = lasers.iterator()
                     while (laserIt.hasNext()) {
@@ -365,6 +416,7 @@ fun GlyphPongDashboard() {
                                 bricksLeft--
                                 score += (BRICK_ROWS - row) * 10
                                 hit = true
+                                playSound("hit")
                                 vibrateShort()
                                 if (bricksLeft <= 0) {
                                     state = GState.WIN
@@ -460,6 +512,7 @@ fun GlyphPongDashboard() {
         // LED Matrix Simulator
         GlyphMatrixSimulator(
             grid = grid,
+            powerUps = powerUps,
             onTap = {
                 when (state) {
                     GState.READY -> {
@@ -546,6 +599,7 @@ fun GlyphPongDashboard() {
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            StatCard("LIVES", lives.toString(), NothingRed, Modifier.weight(0.7f))
             StatCard("SCORE", score.toString(), NothingWhite, Modifier.weight(1f))
             StatCard("BRICKS", bricksLeft.toString(), NothingAmber, Modifier.weight(1f))
             StatCard("BEST", highScore.toString(), NothingGreen, Modifier.weight(1f))
@@ -623,7 +677,7 @@ fun GlyphPongDashboard() {
 // ─── LED Matrix Simulator ────────────────────────────────────────────────────
 
 @Composable
-fun GlyphMatrixSimulator(grid: IntArray, onTap: () -> Unit) {
+fun GlyphMatrixSimulator(grid: IntArray, powerUps: List<PowerUpDrop>, onTap: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -678,9 +732,13 @@ fun GlyphMatrixSimulator(grid: IntArray, onTap: () -> Unit) {
                     val cx = x * cellW + cellW / 2
                     val cy = y * cellH + cellH / 2
 
+                    // Check if this pixel is an EXTRA_LIFE power up
+                    val isExtraLife = powerUps.any { it.type == PowerUpType.EXTRA_LIFE && it.x.roundToInt() == x && it.y.roundToInt() == y }
+
                     // Off-state dot (very dim)
                     drawCircle(
-                        color = if (norm > 0.01f) Color.White.copy(alpha = 0.6f + norm * 0.4f)
+                        color = if (isExtraLife) Color.Red
+                                else if (norm > 0.01f) Color.White.copy(alpha = 0.6f + norm * 0.4f)
                                 else Color.White.copy(alpha = 0.04f),
                         radius = dotRadius,
                         center = Offset(cx, cy)
